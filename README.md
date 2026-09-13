@@ -63,3 +63,8 @@ The model runs entirely on a worker `QThread`; the UI talks to it only
 through queued signals, so neither the cold load nor a multi-minute render
 ever blocks painting. Cancellation sets the pipeline's `_interrupt` flag from
 the denoise callback, which skips the remaining steps cleanly.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Note that the FLUX.1-dev model weights are
+distributed under their own [non-commercial license](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md).
