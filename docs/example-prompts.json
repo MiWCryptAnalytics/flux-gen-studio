@@ -1,0 +1,18 @@
+[
+  {
+    "output_path": "coast/lighthouse.png",
+    "prompt": "A lighthouse on a basalt cliff at dusk, long exposure, low fog, 35mm film"
+  },
+  {
+    "output_path": "coast/fishing-boat.png",
+    "prompt": "A wooden fishing boat hauled onto a shingle beach, overcast morning, muted palette"
+  },
+  {
+    "output_path": "interiors/reading-nook.png",
+    "prompt": "A sunlit reading nook with a worn leather armchair, dust in the light, Kodak Portra"
+  },
+  {
+    "output_path": "interiors/subway-station.png",
+    "prompt": "A tiled 1920s subway station, empty, warm sodium lamps, wide lens"
+  }
+]

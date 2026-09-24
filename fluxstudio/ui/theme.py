@@ -143,6 +143,22 @@ QScrollBar::handle:horizontal {{
     min-width: {m.sp(1.6)}px;
 }}
 
+QTableWidget {{
+    background: {PANEL};
+    alternate-background-color: {PANEL_ALT};
+    border: 1px solid {BORDER};
+    gridline-color: {BORDER};
+    selection-background-color: {ACCENT_DIM};
+}}
+QHeaderView::section {{
+    background: {PANEL_ALT};
+    color: {TEXT_DIM};
+    border: none;
+    border-bottom: 1px solid {BORDER};
+    padding: {pad_y}px {pad_x}px;
+}}
+QTableCornerButton::section {{ background: {PANEL_ALT}; border: none; }}
+
 QProgressBar {{
     background: {PANEL_ALT};
     border: 1px solid {BORDER};

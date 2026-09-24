@@ -37,6 +37,8 @@ class Settings:
     seed: int = 0
     seed_locked: bool = False
     variations: int = 4
+    quant: str = "bf16"  # model precision: bf16 | nf4 | int8 (see engine.loader)
+    batch_dir: str = ""  # last folder a prompt file was opened from
     window_geometry: list[int] = field(default_factory=list)
 
     @classmethod

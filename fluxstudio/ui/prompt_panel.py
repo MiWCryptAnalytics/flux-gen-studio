@@ -26,6 +26,7 @@ def _title(text: str) -> QLabel:
 class PromptPanel(QFrame):
     generateRequested = pyqtSignal()
     variationsRequested = pyqtSignal(int)
+    batchRequested = pyqtSignal()
     cancelRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -82,6 +83,12 @@ class PromptPanel(QFrame):
             lambda: self.variationsRequested.emit(self.variations_spin.value())
         )
 
+        self.batch_button = QPushButton("Batch…")
+        self.batch_button.setToolTip(
+            "Render every prompt in a JSON file, each to its output_path (Ctrl+B)"
+        )
+        self.batch_button.clicked.connect(self.batchRequested.emit)
+
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setProperty("role", "danger")
         self.cancel_button.setToolTip("Stop after the current step (Esc)")
@@ -91,6 +98,7 @@ class PromptPanel(QFrame):
         row.addWidget(self.generate_button, 2)
         row.addWidget(self.variations_button, 1)
         row.addWidget(self.variations_spin)
+        row.addWidget(self.batch_button)
         row.addWidget(self.cancel_button)
         return row
 
@@ -107,6 +115,8 @@ class PromptPanel(QFrame):
         self.generate_button.setEnabled(not busy)
         self.variations_button.setEnabled(not busy)
         self.variations_spin.setEnabled(not busy)
+        # Cancel takes Batch's slot: five controls don't fit the column.
+        self.batch_button.setVisible(not busy)
         self.cancel_button.setVisible(busy)
 
     def _update_stats(self) -> None:

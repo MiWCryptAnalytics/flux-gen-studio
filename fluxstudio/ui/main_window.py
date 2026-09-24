@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices, QGuiApplication, QKeySequence
 from PyQt5.QtWidgets import (
+    QActionGroup,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -23,26 +26,39 @@ from PyQt5.QtWidgets import (
 from .. import APP_NAME
 from ..core.config import EXPORTS_DIR, RENDERS_DIR, Settings, ensure_dirs
 from ..core.history import Render, RenderHistory
-from ..engine import GenRequest, new_seed
+from ..core.prompts import load_prompt_file
+from ..engine import QUANT_LABELS, QUANT_MODES, GenRequest, new_seed
 from .gallery_panel import GalleryPanel
+from .job_panel import JobPanel
 from .metrics import metrics
 from .params_panel import ParamsPanel
+from .perf_dialog import PerfDialog
 from .prompt_panel import PromptPanel
 from .viewer import PreviewPanel
-from .workers import SINGLE, VARIATIONS, EngineHost, GenJob, RenderResult
+from .workers import BATCH, SINGLE, VARIATIONS, EngineHost, GenJob, RenderResult
+
+
+log = logging.getLogger("fluxstudio.ui")
 
 
 class MainWindow(QMainWindow):
-    loadRequested = pyqtSignal()
+    loadRequested = pyqtSignal(str)  # precision to load
     jobRequested = pyqtSignal(object)
 
-    def __init__(self) -> None:
+    def __init__(self, quant: str | None = None) -> None:
         super().__init__()
         ensure_dirs()
 
         self.settings = Settings.load()
+        if quant is not None:
+            self.settings.quant = quant  # CLI override; persists like a menu pick
+        if self.settings.quant not in QUANT_MODES:
+            self.settings.quant = "bf16"
         self.history = RenderHistory.load()
         self._busy = False
+        self._job: GenJob | None = None
+        self._job_renders = 0  # finished renders in the current job
+        self._sec_per_step: float | None = None  # last measured, for estimates
 
         self.setWindowTitle(APP_NAME)
         self.resize(*self._default_size())
@@ -70,15 +86,18 @@ class MainWindow(QMainWindow):
         self.prompt_panel = PromptPanel()
         self.prompt_panel.generateRequested.connect(self.generate_one)
         self.prompt_panel.variationsRequested.connect(self.generate_variations)
+        self.prompt_panel.batchRequested.connect(self.generate_batch)
         self.prompt_panel.cancelRequested.connect(self._cancel_job)
 
         self.params_panel = ParamsPanel()
+        self.job_panel = JobPanel()
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(m.sp(0.6))
         left_layout.addWidget(self.prompt_panel, 1)
+        left_layout.addWidget(self.job_panel, 0)
         left_layout.addWidget(self.params_panel, 0)
 
         self.preview = PreviewPanel()
@@ -115,6 +134,12 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         tools = self.menuBar().addMenu("&Tools")
 
+        batch = tools.addAction("&Batch generate from file…")
+        batch.setShortcut(QKeySequence("Ctrl+B"))
+        batch.triggered.connect(self.generate_batch)
+
+        tools.addSeparator()
+
         export = tools.addAction("&Export current PNG…")
         export.setShortcut(QKeySequence("Ctrl+S"))
         export.triggered.connect(self._export_current)
@@ -123,6 +148,23 @@ class MainWindow(QMainWindow):
         folder.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(RENDERS_DIR)))
         )
+
+        tools.addSeparator()
+
+        precision = tools.addMenu("&Model precision")
+        self.quant_actions = QActionGroup(self)
+        self.quant_actions.setExclusive(True)
+        for mode in QUANT_MODES:
+            action = precision.addAction(QUANT_LABELS[mode])
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setChecked(mode == self.settings.quant)
+            self.quant_actions.addAction(action)
+        self.quant_actions.triggered.connect(self._on_quant_picked)
+
+        perf = tools.addAction("&Performance…")
+        perf.setShortcut(QKeySequence("Ctrl+P"))
+        perf.triggered.connect(self._show_performance)
 
     def _build_status_bar(self) -> None:
         bar = self.statusBar()
@@ -173,20 +215,50 @@ class MainWindow(QMainWindow):
         self.host.loadReady.connect(self._on_load_ready)
         self.host.loadFailed.connect(self._on_load_failed)
         self.host.jobStarted.connect(self._on_job_started)
+        self.host.itemStarted.connect(self._on_item_started)
+        self.host.itemStep.connect(self.job_panel.item_step)
         self.host.jobProgress.connect(self._on_job_progress)
         self.host.renderReady.connect(self._on_render_ready)
         self.host.jobDone.connect(self._on_job_done)
         self.host.jobFailed.connect(self._on_job_failed)
 
         self.thread.start()
+        self._begin_load()
+
+    def _begin_load(self) -> None:
+        self._loading = True
         self.prompt_panel.set_busy(True)
         self.prompt_panel.cancel_button.setVisible(False)
-        self.loadRequested.emit()
+        self.quant_actions.setEnabled(False)
+        self.status_label.setText(f"Loading model ({QUANT_LABELS[self.settings.quant]})…")
+        self.device_label.setText("")
+        self.loadRequested.emit(self.settings.quant)
+
+    def _on_quant_picked(self, action) -> None:
+        mode = action.data()
+        if mode == self.settings.quant:
+            return
+        if self._busy:
+            self._check_quant_action(self.settings.quant)
+            self.status_label.setText("Wait for the current job before changing precision.")
+            return
+        self.settings.quant = mode
+        try:
+            self.settings.save()
+        except OSError:
+            pass
+        log.info("precision set to %s; reloading", mode)
+        self._begin_load()
+
+    def _check_quant_action(self, mode: str) -> None:
+        for action in self.quant_actions.actions():
+            action.setChecked(action.data() == mode)
 
     def _on_load_progress(self, message: str) -> None:
         self.status_label.setText(message)
 
     def _on_load_ready(self, loaded) -> None:
+        self._loading = False
         self.status_label.setText(
             "Ready · loaded from local cache" if loaded.offline else "Ready"
         )
@@ -197,9 +269,19 @@ class MainWindow(QMainWindow):
             if loaded.offline
             else "Model was fetched from the Hugging Face Hub this launch."
         )
+        if loaded.quant != self.settings.quant:
+            # The loader fell back (no bitsandbytes, no CUDA); keep the menu honest.
+            self.settings.quant = loaded.quant
+            self._check_quant_action(loaded.quant)
+            self.status_label.setText(
+                f"Ready · {QUANT_LABELS[loaded.quant]} — quantized precision unavailable here"
+            )
+        self.quant_actions.setEnabled(True)
         self.prompt_panel.set_busy(False)
 
     def _on_load_failed(self, message: str) -> None:
+        self._loading = False
+        self.quant_actions.setEnabled(True)
         self.status_label.setText("Model failed to load")
         QMessageBox.critical(
             self,
@@ -219,7 +301,14 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Model is still loading…")
             return
         self._busy = True
+        self._job = job
+        self._job_renders = 0
         self.prompt_panel.set_busy(True)
+        self.job_panel.begin(job)
+        self.status_label.setText("Starting…")
+        self.progress.setRange(0, 0)  # pulse until the first step reports
+        self.progress.setVisible(True)
+        self._set_title_progress(0)
         self.jobRequested.emit(job)
 
     def generate_one(self) -> None:
@@ -228,9 +317,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Describe an image to generate.")
             return
         seed = self.params_panel.effective_seed()
-        self._submit(
-            GenJob(request=self._build_request(prompt, seed), seeds=[seed], mode=SINGLE)
-        )
+        self._submit(GenJob([self._build_request(prompt, seed)], mode=SINGLE))
 
     def generate_variations(self, count: int) -> None:
         prompt = self.prompt_panel.prompt
@@ -238,17 +325,111 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Describe an image to generate.")
             return
         # Variations explore seed space, so the lock never applies here.
-        seeds = [new_seed() for _ in range(count)]
-        self._submit(
-            GenJob(
-                request=self._build_request(prompt, seeds[0]),
-                seeds=seeds,
-                mode=VARIATIONS,
+        base = self._build_request(prompt, new_seed())
+        requests = [base] + [replace(base, seed=new_seed()) for _ in range(count - 1)]
+        self._submit(GenJob(requests, mode=VARIATIONS))
+
+    def generate_batch(self) -> None:
+        """Render every prompt in a text file with the current image settings."""
+        if self._busy:
+            return
+        if not self.host.is_ready:
+            # Reachable from the menu while the buttons are still disabled, so
+            # say it somewhere more visible than the status bar.
+            QMessageBox.information(
+                self,
+                "Model still loading",
+                "The model is still loading. Batch generation is available "
+                "once the status bar says Ready.",
             )
+            return
+
+        start_dir = self.settings.batch_dir or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Batch generate from prompt file",
+            start_dir,
+            "JSON prompt files (*.json);;All files (*)",
         )
+        if not path:
+            return
+        self.settings.batch_dir = str(Path(path).parent)
+        name = Path(path).name
+
+        try:
+            entries = load_prompt_file(path)
+        except (OSError, ValueError) as exc:
+            log.warning("batch file %s rejected: %s", path, exc)
+            QMessageBox.warning(self, "Could not read prompt file", f"{name}: {exc}")
+            return
+        log.info("batch file %s: %d entries", path, len(entries))
+        if not entries:
+            QMessageBox.information(
+                self,
+                "No prompts found",
+                f"{name} is an empty list. Each entry needs an \"output_path\" "
+                "and a \"prompt\".",
+            )
+            return
+
+        # The seed lock means what it says: every prompt gets the same seed, so
+        # the prompt is the only variable across the batch. Unlocked, each
+        # prompt rolls its own.
+        params = self.params_panel.values()
+        if self.params_panel.seed_locked:
+            seed_note = f"all with locked seed {self.params_panel.seed_spin.value()}"
+        else:
+            seed_note = "each with a fresh random seed"
+        count = len(entries)
+        summary = (
+            f"Render {count} prompt{'s' if count != 1 else ''} from {name}?\n\n"
+            f"{params['width']}×{params['height']} · {params['steps']} steps · "
+            f"guidance {params['guidance']:g}, {seed_note}.\n"
+            "Each image is written to its entry's output_path."
+        )
+        existing = sum(1 for e in entries if e.output_path.exists())
+        if existing:
+            summary += (
+                f"\n\n{existing} output file{'s' if existing != 1 else ''} already "
+                f"exist{'' if existing != 1 else 's'} and will be overwritten."
+            )
+        estimate = self._estimate(count * params["steps"])
+        if estimate:
+            summary += f"\n\nAbout {estimate} at the last measured speed."
+        answer = QMessageBox.question(
+            self,
+            "Batch generate",
+            summary,
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            log.info("batch declined")
+            return
+
+        requests = [
+            self._build_request(entry.prompt, self.params_panel.effective_seed())
+            for entry in entries
+        ]
+        outputs = [str(entry.output_path) for entry in entries]
+        self._submit(GenJob(requests, mode=BATCH, output_paths=outputs))
+
+    def _estimate(self, total_steps: int) -> str:
+        """Human duration for a job, or '' before any render has been timed."""
+        if self._sec_per_step is None:
+            return ""
+        seconds = total_steps * self._sec_per_step
+        if seconds < 90:
+            return f"{seconds:.0f} s"
+        minutes = round(seconds / 60)
+        if minutes < 90:
+            return f"{minutes} min"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} h {minutes:02d} min"
 
     def _cancel_job(self) -> None:
         if self._busy:
+            log.info("cancel requested")
             self.host.cancel()
             self.status_label.setText("Cancelling after the current step…")
 
@@ -256,8 +437,19 @@ class MainWindow(QMainWindow):
 
     def _on_job_started(self, total: int) -> None:
         self.progress.setVisible(True)
-        self.progress.setRange(0, max(1, total))
-        self.progress.setValue(0)
+
+    def _on_item_started(self, index: int, prefix: str) -> None:
+        self.job_panel.item_started(index)
+        self.status_label.setText(f"{prefix} · encoding prompt…")
+
+    def _set_title_progress(self, done: int) -> None:
+        planned = len(self._job.requests) if self._job else 0
+        if planned > 1:
+            self.setWindowTitle(f"[{done}/{planned}] {APP_NAME}")
+        elif planned == 1:
+            self.setWindowTitle(f"[rendering] {APP_NAME}")
+        else:
+            self.setWindowTitle(APP_NAME)
 
     def _on_job_progress(self, message: str, done: int, total: int) -> None:
         self.progress.setRange(0, max(1, total))
@@ -280,18 +472,42 @@ class MainWindow(QMainWindow):
         self.history.add(render)
         self.gallery.refresh()
         self.preview.show_render(render)
+        self._job_renders += 1
+        self.job_panel.item_done(result.index, result.elapsed)
+        self._set_title_progress(self._job_renders)
 
         per_step = result.elapsed / max(1, request.steps)
+        self._sec_per_step = per_step
         self.perf_label.setText(f"{result.elapsed:.1f}s · {per_step:.2f} s/step")
+        if result.timings is not None:
+            self.perf_label.setToolTip(
+                f"{result.timings.describe()} · save {result.save_seconds:.1f} s\n"
+                "Tools ▸ Performance… compares runs."
+            )
 
     def _on_job_done(self, mode: str) -> None:
         self._busy = False
         self.prompt_panel.set_busy(False)
         self.progress.setVisible(False)
-        self.status_label.setText("Cancelled" if mode == "cancelled" else "Ready")
+        done = self._job_renders
+        planned = len(self._job.requests) if self._job else 0
+        if mode == "cancelled":
+            self.status_label.setText(
+                f"Cancelled · {done} of {planned} rendered" if planned > 1 else "Cancelled"
+            )
+        elif mode == BATCH:
+            self.status_label.setText(f"Batch finished · {done} renders")
+        else:
+            self.status_label.setText("Ready")
+        self.job_panel.finish(mode)
+        self._job = None
+        self._set_title_progress(0)
 
     def _on_job_failed(self, message: str) -> None:
         self._busy = False
+        self.job_panel.finish("failed", message.splitlines()[0] if message else "")
+        self._job = None
+        self._set_title_progress(0)
         self.prompt_panel.set_busy(False)
         self.progress.setVisible(False)
         self.status_label.setText("Generation failed")
@@ -327,7 +543,7 @@ class MainWindow(QMainWindow):
             guidance=render.guidance,
             seed=seed,
         )
-        self._submit(GenJob(request=request, seeds=[seed], mode=SINGLE))
+        self._submit(GenJob([request], mode=SINGLE))
 
     def _restore_recipe(self, render_id: str) -> None:
         render = self.history.get(render_id)
@@ -344,6 +560,10 @@ class MainWindow(QMainWindow):
         )
         self.params_panel.show_seed(render.seed)
         self.status_label.setText(f"Restored recipe from render (seed {render.seed})")
+
+    def _show_performance(self) -> None:
+        dialog = PerfDialog(self)
+        dialog.exec_()
 
     def _export_current(self) -> None:
         if self.preview.render is None:
@@ -363,6 +583,7 @@ class MainWindow(QMainWindow):
             return
         try:
             shutil.copyfile(render.png_path, path)
+            log.info("exported %s", path)
             self.status_label.setText(f"Exported to {Path(path).name}")
         except OSError as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
@@ -409,6 +630,7 @@ class MainWindow(QMainWindow):
         s.seed = self.params_panel.seed_spin.value()
         s.seed_locked = self.params_panel.seed_locked
         s.__dict__.update(self.params_panel.values())
+        # s.quant is saved when picked; the CLI override is not persisted here.
         geo = self.geometry()
         s.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
         try:

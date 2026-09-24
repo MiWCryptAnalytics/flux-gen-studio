@@ -34,12 +34,27 @@ def main() -> int:
     from fluxstudio.ui import workers
 
     class FakeHost(workers.EngineHost):
-        def load(self) -> None:
+        jobs: list = []
+
+        loads: list = []
+
+        def load(self, quant: str = "bf16") -> None:
+            self.loads.append(quant)
             self.loadProgress.emit("(smoke) skipping model load")
             self.loaded = workers.LoadedPipeline(
-                pipe=None, device="cpu", device_label="smoke", offline=True
+                pipe=None, device="cpu", device_label="smoke", offline=True, quant=quant
             )
             self.loadReady.emit(self.loaded)
+
+        def run_job(self, job) -> None:
+            # Record the job and walk the signals a real render would emit
+            # for the first item, then stop — nothing is rendered.
+            self.jobs.append(job)
+            self.jobStarted.emit(job.total_steps)
+            self.itemStarted.emit(0, "Batch 1/3 · one")
+            self.itemStep.emit(0, 5, job.requests[0].steps)
+            self.jobProgress.emit("Batch 1/3 · one · step 5", 5, job.total_steps)
+            self.jobDone.emit(job.mode)
 
     # MainWindow resolves EngineHost through its module globals, so patching
     # the name there is enough — no model weights are ever touched.
@@ -91,6 +106,177 @@ def main() -> int:
         # Gallery empty state
         check("gallery counts", window.gallery.count_label.text().startswith("0"))
 
+        # Prompt file parsing
+        import json
+
+        from fluxstudio.core.prompts import load_prompt_file, parse_prompts
+
+        base = Path("/base")
+        parsed = parse_prompts(
+            json.dumps([
+                {"output_path": "a/one", "prompt": "  one  "},
+                {"output_path": "/abs/two.png", "prompt": "two"},
+            ]),
+            base_dir=base,
+        )
+        check("prompt file parsed", [e.prompt for e in parsed] == ["one", "two"])
+        check("relative output resolves + gets .png",
+              parsed[0].output_path == base / "a" / "one.png")
+        check("absolute output kept", parsed[1].output_path == Path("/abs/two.png"))
+
+        def rejects(text: str, needle: str) -> bool:
+            try:
+                parse_prompts(text, base_dir=base)
+            except ValueError as exc:
+                return needle in str(exc)
+            return False
+
+        check("rejects non-array", rejects('{"prompt": "x"}', "JSON array"))
+        check("rejects missing output_path",
+              rejects('[{"prompt": "x"}]', 'Entry 1 needs a non-empty "output_path"'))
+        check("rejects empty prompt",
+              rejects('[{"output_path": "x", "prompt": " "}]', '"prompt"'))
+        check("rejects duplicate output",
+              rejects('[{"output_path": "x", "prompt": "a"},'
+                      ' {"output_path": "x.png", "prompt": "b"}]', "both write to"))
+        check("rejects bad json", rejects("[", "Not valid JSON"))
+
+        # Performance records round-trip and summarise
+        from fluxstudio.core import perf
+
+        perf.set_tag("smoke")
+        for i in range(3):
+            perf.record(perf.PerfRecord(
+                placement="CPU offload", width=1024, height=1024, steps=28,
+                guidance=3.5, seed=i, mode="single", prompt_chars=40,
+                to_first_step=20.0 + i, s_per_step=2.0 + i * 0.1, step_min=1.9,
+                step_max=2.3, decode=3.0, save=0.4, total=80.0 + i, vram_peak_gb=21.0,
+                device="RTX 3090", tag="smoke", quant="nf4" if i == 2 else "bf16",
+            ))
+        records = perf.load_records()
+        check("perf records persisted", len(records) == 3 and records[0].tag == "smoke")
+        summary = perf.summarize(records)
+        check("perf summary groups by precision",
+              len(summary) == 2 and summary[0].runs == 2 and summary[1].quant == "nf4")
+        check("perf summary medians",
+              summary[0].s_per_step == 2.05 and summary[0].total == 80.5)
+        check("encode estimate", abs(records[0].encode_estimate - 18.0) < 1e-9)
+        from fluxstudio.ui.perf_dialog import PerfDialog
+        dialog = PerfDialog(window)
+        check("perf dialog rows",
+              dialog.summary_table.rowCount() == 2 and dialog.recent_table.rowCount() == 3)
+        check("perf dialog cell", dialog.summary_table.item(0, 6).text() == "2.05")
+        dialog.close()
+
+        # Timings arithmetic as the engine fills it
+        from fluxstudio.engine import Timings
+        t = Timings(step_seconds=[25.0, 4.0, 4.2, 4.1], decode=3.5, total=40.8)
+        check("timings s/step is steady median", t.s_per_step == 4.1)
+        check("timings encode estimate", abs(t.encode_estimate - 20.9) < 1e-9)
+        check("timings describe", "4.10 s/step" in t.describe() and "encode ≈21 s" in t.describe())
+
+        smoke_dir = Path(os.environ["XDG_DATA_HOME"])
+        prompt_file = smoke_dir / "smoke-prompts.json"
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        entries = [{"output_path": f"out/{n}.png", "prompt": n}
+                   for n in ("one", "two", "three")]
+        prompt_file.write_bytes(("\ufeff" + json.dumps(entries)).encode("utf-8"))
+        loaded = load_prompt_file(prompt_file)
+        check("prompt file BOM stripped", [e.prompt for e in loaded] == ["one", "two", "three"])
+        check("outputs resolve beside the file",
+              loaded[0].output_path == (smoke_dir / "out" / "one.png").resolve())
+
+        # Batch job submission: stub the two dialogs, then drive the real path.
+        mw.QFileDialog.getOpenFileName = staticmethod(
+            lambda *a, **k: (str(prompt_file), "")
+        )
+        mw.QMessageBox.question = staticmethod(lambda *a, **k: mw.QMessageBox.Yes)
+        window.params_panel.show_seed(777)
+        window.params_panel.seed_lock.setChecked(True)
+        window.generate_batch()
+        check("batch button hidden while busy",
+              not window.prompt_panel.batch_button.isVisible())
+        check("job panel shown on submit", window.job_panel.isVisible())
+        check("job panel lists entries", window.job_panel.list.count() == 3)
+        check("status says starting", window.status_label.text() == "Starting…")
+        check("status bar pulses before first step", window.progress.maximum() == 0)
+        check("title shows batch progress", window.windowTitle().startswith("[0/3]"))
+        QTimer.singleShot(300, verify_batch)
+
+    def verify_batch() -> None:
+        job = FakeHost.jobs[-1] if FakeHost.jobs else None
+        check("batch job reached the engine", job is not None)
+        if job is not None:
+            check("batch job mode", job.mode == workers.BATCH)
+            check("one request per prompt",
+                  [r.prompt for r in job.requests] == ["one", "two", "three"])
+            check("locked seed shared across batch",
+                  {r.seed for r in job.requests} == {777})
+            check("output paths travel with the job",
+                  [Path(p).name for p in job.output_paths] == ["one.png", "two.png", "three.png"])
+            check("batch total steps", job.total_steps == 3 * job.requests[0].steps)
+        check("batch done restores idle",
+              window.prompt_panel.batch_button.isEnabled() and not window._busy)
+        check("batch status reports count",
+              window.status_label.text().startswith("Batch finished · 0"))
+        panel = window.job_panel
+        check("job panel marks finished", panel.title_label.text() == "DONE")
+        check("job panel skips unrendered", panel.list.item(1).text().startswith("–"))
+        check("job panel close shown", panel.close_button.isVisible())
+        check("title restored", window.windowTitle() == mw.APP_NAME)
+
+        # Panel state as it looks while image 2 of 3 is at step 12/28.
+        panel.begin(FakeHost.jobs[-1])
+        check("list sized to its rows",
+              panel.list.height() <= 4 * panel.list.sizeHintForRow(0))
+        panel.item_done(0, 118.0)
+        panel.item_started(1)
+        check("encoding hint before first step",
+              "Encoding" in panel.current_label.text())
+        panel.item_step(1, 12, 28)
+        check("step bar tracks", panel.step_bar.value() == 12 and panel.step_bar.maximum() == 28)
+        check("overall counts renders", panel.overall_label.text().startswith("1 of 3"))
+        check("eta shown", "left" in panel.eta_label.text())
+        window.settings.batch_dir = ""  # don't persist the smoke folder
+
+        window.params_panel.seed_lock.setChecked(False)
+        window.generate_batch()
+        QTimer.singleShot(300, verify_unlocked)
+
+    def verify_unlocked() -> None:
+        job = FakeHost.jobs[-1]
+        check("unlocked batch rolls distinct seeds",
+              len({r.seed for r in job.requests}) == 3 and 777 not in
+              {r.seed for r in job.requests})
+
+        # Model precision menu: picking a mode reloads with it. The reload
+        # request is a queued cross-thread signal, so verify after a beat.
+        check("initial load used saved precision", FakeHost.loads == ["bf16"])
+        checked = [a for a in window.quant_actions.actions() if a.isChecked()]
+        check("bf16 checked in menu", len(checked) == 1 and checked[0].data() == "bf16")
+        nf4 = next(a for a in window.quant_actions.actions() if a.data() == "nf4")
+        nf4.trigger()
+        check("reload disables the menu", not window.quant_actions.isEnabled())
+        check("precision persisted", window.settings.quant == "nf4")
+        QTimer.singleShot(300, verify_quant)
+
+    def verify_quant() -> None:
+        check("picking nf4 reloads", FakeHost.loads == ["bf16", "nf4"])
+        check("menu re-enabled after load", window.quant_actions.isEnabled())
+        check("prompt usable after reload", window.prompt_panel.generate_button.isEnabled())
+        window.settings.quant = "bf16"  # don't persist the smoke pick
+        finish()
+
+    def finish() -> None:
+        # Stage a mid-batch frame so the screenshot shows the panel at work.
+        panel = window.job_panel
+        panel.begin(FakeHost.jobs[-1])
+        panel.item_done(0, 118.0)
+        panel.item_started(1)
+        panel.item_step(1, 12, 28)
+        window.prompt_panel.set_busy(True)
+        window.status_label.setText("Batch 2/3 · two · step 12/28")
+        app.processEvents()  # let the layout settle before the grab
         target = sys.argv[1] if len(sys.argv) > 1 else ""
         if target:
             window.grab().save(target)

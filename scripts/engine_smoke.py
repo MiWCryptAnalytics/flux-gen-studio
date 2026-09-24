@@ -3,7 +3,7 @@
 Verifies the diffusers API surface the app depends on: pipeline load with the
 dtype kwarg, the step callback, interrupt-based cancellation, and PNG metadata.
 
-Usage: .venv/bin/python scripts/engine_smoke.py <out_dir>
+Usage: .venv/bin/python scripts/engine_smoke.py <out_dir> [--full] [--quant nf4|int8]
 """
 
 from __future__ import annotations
@@ -14,15 +14,21 @@ from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fluxstudio.engine import GenRequest, load_pipeline, run_generation
+from fluxstudio.engine import GenRequest, Timings, load_pipeline, run_generation
 
 
 def main() -> int:
-    out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    out_dir = Path(args[0] if args else ".")
     out_dir.mkdir(parents=True, exist_ok=True)
+    quant = "bf16"
+    if "--quant" in sys.argv:
+        quant = sys.argv[sys.argv.index("--quant") + 1]
 
     t0 = perf_counter()
-    loaded = load_pipeline(progress=lambda m: print(f"[load] {m}", flush=True))
+    loaded = load_pipeline(
+        progress=lambda m: print(f"[load] {m}", flush=True), quant=quant
+    )
     print(f"[load] done in {perf_counter() - t0:.0f}s · {loaded.device_label} · "
           f"offline={loaded.offline}", flush=True)
 
@@ -60,18 +66,18 @@ def main() -> int:
                "low fog, warm lamp light against blue hour, 35mm photograph",
         width=1024, height=1024, steps=28, guidance=3.5,
     )
-    t0 = perf_counter()
+    timings = Timings()
     image = run_generation(
         loaded.pipe, request, seed=7,
         on_step=lambda s: print(f"[gen] step {s}/28", flush=True) if s % 7 == 0 else None,
         cancelled=lambda: False,
+        timings=timings,
     )
-    elapsed = perf_counter() - t0
     assert image is not None and image.size == (1024, 1024), image
     full = out_dir / "smoke_1024.png"
     image.save(full)
-    print(f"[gen] 1024×1024·28 steps in {elapsed:.1f}s "
-          f"({elapsed / 28:.2f} s/step) -> {full}", flush=True)
+    print(f"[gen] 1024×1024·28 steps in {timings.total:.1f}s -> {full}", flush=True)
+    print(f"[perf] {loaded.device_label}: {timings.describe()}", flush=True)
     print("ENGINE SMOKE OK", flush=True)
     return 0
 
