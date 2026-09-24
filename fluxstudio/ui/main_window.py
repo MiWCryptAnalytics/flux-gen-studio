@@ -27,7 +27,16 @@ from .. import APP_NAME
 from ..core.config import EXPORTS_DIR, RENDERS_DIR, Settings, ensure_dirs
 from ..core.history import Render, RenderHistory
 from ..core.prompts import load_prompt_file
-from ..engine import QUANT_LABELS, QUANT_MODES, GenRequest, new_seed
+from ..engine import (
+    DEFAULT_MODEL,
+    MODELS,
+    QUANT_LABELS,
+    QUANT_MODES,
+    GenRequest,
+    model_label,
+    new_seed,
+    quant_label,
+)
 from .gallery_panel import GalleryPanel
 from .job_panel import JobPanel
 from .metrics import metrics
@@ -42,18 +51,25 @@ log = logging.getLogger("fluxstudio.ui")
 
 
 class MainWindow(QMainWindow):
-    loadRequested = pyqtSignal(str)  # precision to load
+    loadRequested = pyqtSignal(str, str)  # model key, precision to load
     jobRequested = pyqtSignal(object)
 
-    def __init__(self, quant: str | None = None) -> None:
+    def __init__(self, quant: str | None = None, model: str | None = None) -> None:
         super().__init__()
         ensure_dirs()
 
         self.settings = Settings.load()
+        # CLI overrides persist like a menu pick.
+        if model is not None:
+            self.settings.model = model
         if quant is not None:
-            self.settings.quant = quant  # CLI override; persists like a menu pick
+            self.settings.quant = quant
+        if self.settings.model not in MODELS:
+            self.settings.model = DEFAULT_MODEL
         if self.settings.quant not in QUANT_MODES:
             self.settings.quant = "bf16"
+        if self.settings.quant not in self.spec.quants:
+            self.settings.quant = self.spec.default_quant
         self.history = RenderHistory.load()
         self._busy = False
         self._job: GenJob | None = None
@@ -65,7 +81,13 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_shortcuts()
         self._restore_settings()
+        self.params_panel.set_model(self.spec)
         self._start_engine()
+
+    @property
+    def spec(self):
+        """The ModelSpec the settings point at."""
+        return MODELS[self.settings.model]
 
     # ---------- layout ----------
 
@@ -151,16 +173,28 @@ class MainWindow(QMainWindow):
 
         tools.addSeparator()
 
-        precision = tools.addMenu("&Model precision")
+        models = tools.addMenu("&Model")
+        self.model_actions = QActionGroup(self)
+        self.model_actions.setExclusive(True)
+        for key, spec in MODELS.items():
+            action = models.addAction(spec.label)
+            action.setCheckable(True)
+            action.setData(key)
+            action.setChecked(key == self.settings.model)
+            action.setToolTip(spec.repo)
+            self.model_actions.addAction(action)
+        self.model_actions.triggered.connect(self._on_model_picked)
+
+        precision = tools.addMenu("Model &precision")
         self.quant_actions = QActionGroup(self)
         self.quant_actions.setExclusive(True)
         for mode in QUANT_MODES:
             action = precision.addAction(QUANT_LABELS[mode])
             action.setCheckable(True)
             action.setData(mode)
-            action.setChecked(mode == self.settings.quant)
             self.quant_actions.addAction(action)
         self.quant_actions.triggered.connect(self._on_quant_picked)
+        self._sync_quant_menu()
 
         perf = tools.addAction("&Performance…")
         perf.setShortcut(QKeySequence("Ctrl+P"))
@@ -229,10 +263,30 @@ class MainWindow(QMainWindow):
         self._loading = True
         self.prompt_panel.set_busy(True)
         self.prompt_panel.cancel_button.setVisible(False)
+        self.model_actions.setEnabled(False)
         self.quant_actions.setEnabled(False)
-        self.status_label.setText(f"Loading model ({QUANT_LABELS[self.settings.quant]})…")
+        self.status_label.setText(
+            f"Loading {self.spec.label} ({QUANT_LABELS[self.settings.quant]})…"
+        )
         self.device_label.setText("")
-        self.loadRequested.emit(self.settings.quant)
+        self.loadRequested.emit(self.settings.model, self.settings.quant)
+
+    def _on_model_picked(self, action) -> None:
+        key = action.data()
+        if key == self.settings.model:
+            return
+        if self._busy:
+            self._check_model_action(self.settings.model)
+            self.status_label.setText("Wait for the current job before changing the model.")
+            return
+        self.settings.model = key
+        if self.settings.quant not in self.spec.quants:
+            self.settings.quant = self.spec.default_quant
+        self._sync_quant_menu()
+        self.params_panel.set_model(self.spec, adjust=True)
+        self._save_settings_quietly()
+        log.info("model set to %s (%s); reloading", key, self.settings.quant)
+        self._begin_load()
 
     def _on_quant_picked(self, action) -> None:
         mode = action.data()
@@ -243,16 +297,36 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Wait for the current job before changing precision.")
             return
         self.settings.quant = mode
+        self._save_settings_quietly()
+        log.info("precision set to %s; reloading", mode)
+        self._begin_load()
+
+    def _save_settings_quietly(self) -> None:
         try:
             self.settings.save()
         except OSError:
             pass
-        log.info("precision set to %s; reloading", mode)
-        self._begin_load()
+
+    def _check_model_action(self, key: str) -> None:
+        for action in self.model_actions.actions():
+            action.setChecked(action.data() == key)
 
     def _check_quant_action(self, mode: str) -> None:
         for action in self.quant_actions.actions():
             action.setChecked(action.data() == mode)
+
+    def _sync_quant_menu(self) -> None:
+        """Only the precisions the current model can run here are pickable."""
+        spec = self.spec
+        for action in self.quant_actions.actions():
+            mode = action.data()
+            action.setText(quant_label(spec.key, mode))
+            action.setEnabled(mode in spec.quants)
+            action.setChecked(mode == self.settings.quant)
+            action.setToolTip(
+                "" if mode in spec.quants else
+                f"{spec.label} runs only as {QUANT_LABELS[spec.default_quant]} in this studio."
+            )
 
     def _on_load_progress(self, message: str) -> None:
         self.status_label.setText(message)
@@ -263,24 +337,29 @@ class MainWindow(QMainWindow):
             "Ready · loaded from local cache" if loaded.offline else "Ready"
         )
         source = "cached" if loaded.offline else "hub"
-        self.device_label.setText(f"{loaded.device_label} · {source}")
+        self.device_label.setText(f"{loaded.spec.label} · {loaded.device_label} · {source}")
         self.device_label.setToolTip(
-            "Model loaded from the local cache — no network needed."
-            if loaded.offline
-            else "Model was fetched from the Hugging Face Hub this launch."
+            f"{loaded.spec.repo}\n"
+            + ("Loaded from the local cache — no network needed."
+               if loaded.offline
+               else "Fetched from the Hugging Face Hub this launch.")
         )
         if loaded.quant != self.settings.quant:
-            # The loader fell back (no bitsandbytes, no CUDA); keep the menu honest.
+            # The loader fell back (no bitsandbytes, no CUDA, or a precision
+            # this model can't run here); keep the menu honest.
+            requested = QUANT_LABELS[self.settings.quant]
             self.settings.quant = loaded.quant
             self._check_quant_action(loaded.quant)
             self.status_label.setText(
-                f"Ready · {QUANT_LABELS[loaded.quant]} — quantized precision unavailable here"
+                f"Ready · {QUANT_LABELS[loaded.quant]} — {requested} unavailable here"
             )
+        self.model_actions.setEnabled(True)
         self.quant_actions.setEnabled(True)
         self.prompt_panel.set_busy(False)
 
     def _on_load_failed(self, message: str) -> None:
         self._loading = False
+        self.model_actions.setEnabled(True)
         self.quant_actions.setEnabled(True)
         self.status_label.setText("Model failed to load")
         QMessageBox.critical(
@@ -468,6 +547,7 @@ class MainWindow(QMainWindow):
             png_path=result.png_path,
             elapsed=result.elapsed,
             label=result.label,
+            model=result.model,
         )
         self.history.add(render)
         self.gallery.refresh()
@@ -559,7 +639,13 @@ class MainWindow(QMainWindow):
             }
         )
         self.params_panel.show_seed(render.seed)
-        self.status_label.setText(f"Restored recipe from render (seed {render.seed})")
+        note = f"Restored recipe from render (seed {render.seed})"
+        if render.model and render.model != self.settings.model:
+            note += (
+                f" — rendered with {model_label(render.model)}; pick it under "
+                "Tools ▸ Model to reproduce it exactly"
+            )
+        self.status_label.setText(note)
 
     def _show_performance(self) -> None:
         dialog = PerfDialog(self)
@@ -630,7 +716,7 @@ class MainWindow(QMainWindow):
         s.seed = self.params_panel.seed_spin.value()
         s.seed_locked = self.params_panel.seed_locked
         s.__dict__.update(self.params_panel.values())
-        # s.quant is saved when picked; the CLI override is not persisted here.
+        # s.model and s.quant are saved when picked.
         geo = self.geometry()
         s.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
         try:

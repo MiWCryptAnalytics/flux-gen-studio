@@ -17,18 +17,19 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..engine import new_seed
+from ..engine import DEFAULT_MODEL, MODELS, ModelSpec, new_seed
 from ..engine.generate import DIM_STEP
 from .metrics import metrics
 
+# Reset targets. Steps and guidance follow the loaded model (see set_model).
 DEFAULTS = {
     "width": 1024,
     "height": 1024,
-    "steps": 28,
-    "guidance": 3.5,
+    "steps": MODELS[DEFAULT_MODEL].steps,
+    "guidance": MODELS[DEFAULT_MODEL].guidance,
 }
 
-# Sizes FLUX.1-dev was tuned around (~1 MP), by aspect ratio.
+# Sizes both FLUX models were tuned around (~1 MP), by aspect ratio.
 ASPECT_PRESETS = [
     ("1:1 · 1024×1024", 1024, 1024),
     ("3:4 · 896×1152", 896, 1152),
@@ -53,6 +54,8 @@ class ParamsPanel(QFrame):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setProperty("role", "panel")
+        self._defaults = dict(DEFAULTS)
+        self._spec: ModelSpec = MODELS[DEFAULT_MODEL]
 
         m = metrics()
         layout = QVBoxLayout(self)
@@ -90,21 +93,13 @@ class ParamsPanel(QFrame):
         self.height_spin.setToolTip("Must be a multiple of 16")
 
         self.steps_spin = QSpinBox()
-        self.steps_spin.setRange(1, 50)
-        self.steps_spin.setToolTip(
-            "Denoising steps. 28 is the quality/speed sweet spot for FLUX.1-dev;\n"
-            "50 squeezes out a little more detail at nearly double the time."
-        )
+        self.steps_spin.setRange(1, 100)
 
         self.guidance_spin = QDoubleSpinBox()
         self.guidance_spin.setRange(0.0, 20.0)
         self.guidance_spin.setSingleStep(0.5)
         self.guidance_spin.setDecimals(1)
-        self.guidance_spin.setToolTip(
-            "Distilled guidance scale. 3.5 is the model default; lower is looser\n"
-            "and more photographic, higher follows the prompt more literally but\n"
-            "can look 'baked'."
-        )
+        self._apply_hints()
 
         fields = [
             ("Width", self.width_spin),
@@ -191,6 +186,30 @@ class ParamsPanel(QFrame):
         row.addWidget(self.seed_lock)
         return row
 
+    # ---------- model ----------
+
+    def set_model(self, spec: ModelSpec, adjust: bool = False) -> None:
+        """Point the tooltips and Reset at a model's reference settings.
+
+        With ``adjust``, steps and guidance that still sit at the previous
+        model's defaults move to the new model's — a user who never touched
+        them gets the right numbers, one who did keeps theirs.
+        """
+        previous = dict(self._defaults)
+        self._spec = spec
+        self._defaults = {**DEFAULTS, "steps": spec.steps, "guidance": spec.guidance}
+        self._apply_hints()
+        if adjust and (
+            self.steps_spin.value() == previous["steps"]
+            and self.guidance_spin.value() == previous["guidance"]
+        ):
+            self.steps_spin.setValue(spec.steps)
+            self.guidance_spin.setValue(spec.guidance)
+
+    def _apply_hints(self) -> None:
+        self.steps_spin.setToolTip(self._spec.steps_hint)
+        self.guidance_spin.setToolTip(self._spec.guidance_hint)
+
     # ---------- state ----------
 
     @property
@@ -223,11 +242,12 @@ class ParamsPanel(QFrame):
         }
 
     def apply(self, values: dict) -> None:
-        self.width_spin.setValue(int(values.get("width", DEFAULTS["width"])))
-        self.height_spin.setValue(int(values.get("height", DEFAULTS["height"])))
-        self.steps_spin.setValue(int(values.get("steps", DEFAULTS["steps"])))
-        self.guidance_spin.setValue(float(values.get("guidance", DEFAULTS["guidance"])))
+        d = self._defaults
+        self.width_spin.setValue(int(values.get("width", d["width"])))
+        self.height_spin.setValue(int(values.get("height", d["height"])))
+        self.steps_spin.setValue(int(values.get("steps", d["steps"])))
+        self.guidance_spin.setValue(float(values.get("guidance", d["guidance"])))
         self._on_size_edited()
 
     def reset_defaults(self) -> None:
-        self.apply(DEFAULTS)
+        self.apply(self._defaults)

@@ -8,9 +8,9 @@ from statistics import median
 from time import perf_counter
 from typing import Callable
 
-# FLUX packs 2×2 latent patches over the VAE's 8× factor, so dimensions must be
-# multiples of 16 — the pipeline silently rounds otherwise and the saved size
-# would no longer match the recipe.
+# FLUX packs 2×2 latent patches over the VAE's 8× factor (both FLUX.1 and
+# FLUX.2), so dimensions must be multiples of 16 — the pipeline silently rounds
+# otherwise and the saved size would no longer match the recipe.
 DIM_STEP = 16
 
 
@@ -22,7 +22,8 @@ class GenRequest:
     steps: int = 28
     guidance: float = 3.5
     seed: int = 0
-    # T5 prompt window; 512 is the model's trained maximum.
+    # Prompt token window (T5 for FLUX.1, Mistral for FLUX.2); 512 is the
+    # trained maximum for both.
     max_sequence_length: int = 512
 
 
@@ -113,6 +114,7 @@ def run_generation(
             p._interrupt = True
         return {}
 
+    # Both FluxPipeline and Flux2Pipeline take exactly these keywords.
     result = pipe(
         prompt=request.prompt,
         width=request.width,

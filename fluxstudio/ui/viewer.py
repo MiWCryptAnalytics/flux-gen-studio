@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..core.history import Render
+from ..engine import model_label
 from . import theme
 from .metrics import metrics
 
@@ -139,6 +140,7 @@ class PreviewPanel(QFrame):
         self.meta_label.setText(
             f"{render.width}×{render.height} · seed {render.seed} · "
             f"{render.steps} steps · g{render.guidance:g}"
+            + (f" · {model_label(render.model)}" if render.model else "")
         )
         self.title_label.setText(render.title)
         self.title_label.setToolTip(render.prompt)

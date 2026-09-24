@@ -53,6 +53,7 @@ class PerfRecord:
     device: str = ""  # GPU name
     tag: str = ""
     quant: str = "bf16"  # model precision: bf16 | nf4 | int8
+    model: str = "flux1"  # which model: flux1 | flux2 (see engine.loader.MODELS)
     when: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     @property
@@ -97,6 +98,7 @@ class Summary:
     """Median timings for one configuration."""
 
     tag: str
+    model: str
     quant: str
     placement: str
     size: str
@@ -110,14 +112,15 @@ class Summary:
 
 
 def summarize(records: list[PerfRecord]) -> list[Summary]:
-    """Group by (tag, quant, placement, size, steps); most-run first."""
+    """Group by (tag, model, quant, placement, size, steps); most-run first."""
     groups: dict[tuple, list[PerfRecord]] = {}
     for rec in records:
-        key = (rec.tag, rec.quant, rec.placement, rec.size, rec.steps)
+        key = (rec.tag, rec.model, rec.quant, rec.placement, rec.size, rec.steps)
         groups.setdefault(key, []).append(rec)
     summaries = [
         Summary(
             tag=tag,
+            model=model,
             quant=quant,
             placement=placement,
             size=size,
@@ -129,7 +132,9 @@ def summarize(records: list[PerfRecord]) -> list[Summary]:
             total=median(r.total for r in rows),
             vram_peak_gb=max(r.vram_peak_gb for r in rows),
         )
-        for (tag, quant, placement, size, steps), rows in groups.items()
+        for (tag, model, quant, placement, size, steps), rows in groups.items()
     ]
-    summaries.sort(key=lambda s: (-s.runs, s.tag, s.quant, s.placement, s.size, s.steps))
+    summaries.sort(
+        key=lambda s: (-s.runs, s.tag, s.model, s.quant, s.placement, s.size, s.steps)
+    )
     return summaries

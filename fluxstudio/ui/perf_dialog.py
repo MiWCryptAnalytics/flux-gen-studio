@@ -23,18 +23,20 @@ from PyQt5.QtWidgets import (
 )
 
 from ..core.perf import PERF_FILE, PerfRecord, Summary, current_tag, load_records, summarize
+from ..engine import model_label
 from .metrics import metrics
 
 RECENT_ROWS = 40
 
 SUMMARY_COLUMNS = [
-    ("Tag", "tag"), ("Precision", "quant"), ("Placement", "placement"),
+    ("Tag", "tag"), ("Model", "model"), ("Precision", "quant"), ("Placement", "placement"),
     ("Size", "size"), ("Steps", "steps"),
     ("Runs", "runs"), ("s/step", "s_per_step"), ("First step", "to_first_step"),
     ("Decode", "decode"), ("Total", "total"), ("VRAM peak", "vram_peak_gb"),
 ]
 RECENT_COLUMNS = [
-    ("When", "when"), ("Tag", "tag"), ("Precision", "quant"), ("Placement", "placement"),
+    ("When", "when"), ("Tag", "tag"), ("Model", "model"), ("Precision", "quant"),
+    ("Placement", "placement"),
     ("Size", "size"),
     ("Steps", "steps"), ("s/step", "s_per_step"), ("First step", "to_first_step"),
     ("Decode", "decode"), ("Save", "save"), ("Total", "total"), ("VRAM peak", "vram_peak_gb"),
@@ -128,4 +130,6 @@ class PerfDialog(QDialog):
                     value = value.replace("T", " ")
                 elif attr == "tag" and not value:
                     value = "—"
+                elif attr == "model":
+                    value = model_label(value)
                 table.setItem(r, c, _cell(value))

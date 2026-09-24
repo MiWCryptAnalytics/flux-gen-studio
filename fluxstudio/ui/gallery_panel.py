@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..core.history import Render, RenderHistory
+from ..engine import model_label
 from . import theme
 from .metrics import metrics
 
@@ -75,6 +76,7 @@ class RenderCard(QFrame):
         meta = QLabel(
             f"{render.when} · {render.width}×{render.height} · seed {render.seed} · "
             f"{render.steps} steps · g{render.guidance:g}"
+            + (f" · {model_label(render.model)}" if render.model else "")
         )
         meta.setProperty("role", "metric")
         meta.setWordWrap(True)

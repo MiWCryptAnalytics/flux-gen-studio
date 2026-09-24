@@ -41,9 +41,14 @@ def main() -> int:
         help="label this session's performance records (see Tools ▸ Performance…)",
     )
     parser.add_argument(
+        "--model", choices=("flux1", "flux2"), default=None,
+        help="which model to load, overriding the saved setting: flux1 (FLUX.1-dev) "
+             "or flux2 (FLUX.2-dev, NF4 only, ~20 GiB free VRAM)",
+    )
+    parser.add_argument(
         "--quant", choices=("bf16", "nf4", "int8"), default=None,
         help="model precision for this launch, overriding the saved setting "
-             "(nf4 needs ~14 GiB free VRAM to run fully on the GPU)",
+             "(nf4 needs ~14 GiB free VRAM to run FLUX.1-dev fully on the GPU)",
     )
     args, qt_args = parser.parse_known_args()
     _configure_logging(args.verbose)
@@ -76,7 +81,7 @@ def main() -> int:
 
     app.setStyleSheet(build_qss(refresh()))
 
-    window = MainWindow(quant=args.quant)
+    window = MainWindow(quant=args.quant, model=args.model)
     window.show()
     return app.exec_()
 

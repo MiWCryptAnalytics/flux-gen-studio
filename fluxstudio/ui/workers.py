@@ -27,6 +27,8 @@ from pathlib import Path
 from ..core import perf
 from ..core.history import new_png_path
 from ..engine import (
+    DEFAULT_MODEL,
+    MODELS,
     GenRequest,
     LoadedPipeline,
     Timings,
@@ -82,6 +84,7 @@ class RenderResult:
     index: int = 0  # position in the job
     timings: Timings | None = None  # phase breakdown of the pipeline call
     save_seconds: float = 0.0
+    model: str = DEFAULT_MODEL  # which model rendered it (key into MODELS)
 
 
 class EngineHost(QObject):
@@ -112,8 +115,8 @@ class EngineHost(QObject):
         """Thread-safe: called from the UI thread, read by the denoise loop."""
         self._cancel.set()
 
-    @pyqtSlot(str)
-    def load(self, quant: str = "bf16") -> None:
+    @pyqtSlot(str, str)
+    def load(self, model: str = DEFAULT_MODEL, quant: str = "bf16") -> None:
         def progress(message: str) -> None:
             log.info("load: %s", message)
             self.loadProgress.emit(message)
@@ -123,14 +126,15 @@ class EngineHost(QObject):
 
         start = perf_counter()
         try:
-            self.loaded = load_pipeline(progress=progress, quant=quant)
+            self.loaded = load_pipeline(progress=progress, quant=quant, model=model)
         except Exception:
             log.exception("model load failed")
             _release_vram()
             self.loadFailed.emit(traceback.format_exc(limit=3))
             return
         log.info(
-            "ready: %s, %s, loaded in %.0f s",
+            "ready: %s, %s, %s, loaded in %.0f s",
+            self.loaded.spec.label,
             self.loaded.device_label,
             "local cache" if self.loaded.offline else "hub",
             perf_counter() - start,
@@ -167,9 +171,9 @@ class EngineHost(QObject):
         done_before = 0  # steps completed by earlier renders in this job
         first = job.requests[0]
         log.info(
-            "job: %s, %d image%s, %dx%d, %d steps, guidance %g (%d steps total)",
+            "job: %s, %d image%s, %dx%d, %d steps, guidance %g, %s (%d steps total)",
             job.mode, count, "" if count == 1 else "s", first.width, first.height,
-            first.steps, first.guidance, total,
+            first.steps, first.guidance, self.loaded.spec.label, total,
         )
         self.jobStarted.emit(total)
         job_start = perf_counter()
@@ -222,7 +226,7 @@ class EngineHost(QObject):
 
                 save_start = perf_counter()
                 path = new_png_path()
-                image.save(path, pnginfo=_png_metadata(request, seed))
+                image.save(path, pnginfo=_png_metadata(request, seed, self.loaded.spec.repo))
                 log.info("%d/%d saved %s", index + 1, count, path)
                 output = job.output_path(index)
                 if output:
@@ -242,6 +246,7 @@ class EngineHost(QObject):
                         index=index,
                         timings=timings,
                         save_seconds=save_seconds,
+                        model=self.loaded.model,
                     )
                 )
         except OutputError as exc:
@@ -252,9 +257,13 @@ class EngineHost(QObject):
             _release_vram()
             log.exception("job failed")
             if _is_oom(exc):
+                spec = self.loaded.spec
+                need = spec.model_offload_gb.get(self.loaded.quant)
                 self.jobFailed.emit(
                     "The GPU ran out of memory. Try a smaller resolution — "
-                    "1024×1024 is the sweet spot for this card."
+                    "1024×1024 is the sweet spot — or close other GPU apps"
+                    + (f": {spec.label} {self.loaded.quant} needs about {need:.0f} GiB free."
+                       if need else ".")
                 )
             else:
                 self.jobFailed.emit(traceback.format_exc(limit=3))
@@ -290,6 +299,7 @@ class EngineHost(QObject):
             device=self.loaded.device_name,
             tag=perf.current_tag(),
             quant=self.loaded.quant,
+            model=self.loaded.model,
         )
         try:
             perf.record(rec)
@@ -327,13 +337,13 @@ def _progress_prefix(job: GenJob, index: int) -> str:
     return f"Batch{which} · {_head(job.requests[index].prompt, STATUS_PROMPT_CHARS)}"
 
 
-def _png_metadata(request: GenRequest, seed: int):
+def _png_metadata(request: GenRequest, seed: int, model_repo: str):
     """Embed the full recipe in the PNG so an exported file explains itself."""
     from PIL.PngImagePlugin import PngInfo
 
     meta = PngInfo()
     meta.add_text("prompt", request.prompt)
-    meta.add_text("model", "black-forest-labs/FLUX.1-dev")
+    meta.add_text("model", model_repo)
     meta.add_text("seed", str(seed))
     meta.add_text("steps", str(request.steps))
     meta.add_text("guidance", f"{request.guidance:g}")

@@ -32,6 +32,7 @@ class Render:
     png_path: str = ""
     elapsed: float = 0.0
     label: str = ""
+    model: str = ""  # flux1 | flux2; "" for renders from before the field existed
     starred: bool = False
     id: str = field(default_factory=lambda: uuid4().hex[:12])
     when: str = field(default_factory=lambda: datetime.now().strftime("%H:%M"))

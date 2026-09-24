@@ -38,11 +38,12 @@ def main() -> int:
 
         loads: list = []
 
-        def load(self, quant: str = "bf16") -> None:
-            self.loads.append(quant)
+        def load(self, model: str = "flux1", quant: str = "bf16") -> None:
+            self.loads.append((model, quant))
             self.loadProgress.emit("(smoke) skipping model load")
             self.loaded = workers.LoadedPipeline(
-                pipe=None, device="cpu", device_label="smoke", offline=True, quant=quant
+                pipe=None, device="cpu", device_label="smoke", offline=True,
+                quant=quant, model=model,
             )
             self.loadReady.emit(self.loaded)
 
@@ -152,12 +153,14 @@ def main() -> int:
                 to_first_step=20.0 + i, s_per_step=2.0 + i * 0.1, step_min=1.9,
                 step_max=2.3, decode=3.0, save=0.4, total=80.0 + i, vram_peak_gb=21.0,
                 device="RTX 3090", tag="smoke", quant="nf4" if i == 2 else "bf16",
+                model="flux2" if i == 2 else "flux1",
             ))
         records = perf.load_records()
         check("perf records persisted", len(records) == 3 and records[0].tag == "smoke")
         summary = perf.summarize(records)
-        check("perf summary groups by precision",
-              len(summary) == 2 and summary[0].runs == 2 and summary[1].quant == "nf4")
+        check("perf summary groups by model and precision",
+              len(summary) == 2 and summary[0].runs == 2
+              and (summary[1].model, summary[1].quant) == ("flux2", "nf4"))
         check("perf summary medians",
               summary[0].s_per_step == 2.05 and summary[0].total == 80.5)
         check("encode estimate", abs(records[0].encode_estimate - 18.0) < 1e-9)
@@ -165,7 +168,9 @@ def main() -> int:
         dialog = PerfDialog(window)
         check("perf dialog rows",
               dialog.summary_table.rowCount() == 2 and dialog.recent_table.rowCount() == 3)
-        check("perf dialog cell", dialog.summary_table.item(0, 6).text() == "2.05")
+        check("perf dialog cell", dialog.summary_table.item(0, 7).text() == "2.05")
+        check("perf dialog names the model",
+              dialog.summary_table.item(1, 1).text() == "FLUX.2-dev")
         dialog.close()
 
         # Timings arithmetic as the engine fills it
@@ -251,7 +256,8 @@ def main() -> int:
 
         # Model precision menu: picking a mode reloads with it. The reload
         # request is a queued cross-thread signal, so verify after a beat.
-        check("initial load used saved precision", FakeHost.loads == ["bf16"])
+        check("initial load used saved model and precision",
+              FakeHost.loads == [("flux1", "bf16")])
         checked = [a for a in window.quant_actions.actions() if a.isChecked()]
         check("bf16 checked in menu", len(checked) == 1 and checked[0].data() == "bf16")
         nf4 = next(a for a in window.quant_actions.actions() if a.data() == "nf4")
@@ -261,10 +267,44 @@ def main() -> int:
         QTimer.singleShot(300, verify_quant)
 
     def verify_quant() -> None:
-        check("picking nf4 reloads", FakeHost.loads == ["bf16", "nf4"])
+        check("picking nf4 reloads", FakeHost.loads == [("flux1", "bf16"), ("flux1", "nf4")])
         check("menu re-enabled after load", window.quant_actions.isEnabled())
         check("prompt usable after reload", window.prompt_panel.generate_button.isEnabled())
-        window.settings.quant = "bf16"  # don't persist the smoke pick
+
+        # Model menu: FLUX.2 only runs as NF4 here, so bf16/int8 grey out and
+        # the untouched steps/guidance follow the model's reference settings.
+        window.params_panel.apply({"steps": 28, "guidance": 3.5})
+        flux2 = next(a for a in window.model_actions.actions() if a.data() == "flux2")
+        flux2.trigger()
+        check("model persisted", window.settings.model == "flux2")
+        check("model keeps nf4", window.settings.quant == "nf4")
+        bf16 = next(a for a in window.quant_actions.actions() if a.data() == "bf16")
+        check("bf16 greyed out for FLUX.2", not bf16.isEnabled())
+        check("defaults follow the model",
+              window.params_panel.values()["steps"] == 50
+              and window.params_panel.values()["guidance"] == 4.0)
+        window.params_panel.steps_spin.setValue(20)
+        QTimer.singleShot(300, verify_model)
+
+    def verify_model() -> None:
+        check("picking FLUX.2 reloads", FakeHost.loads[-1] == ("flux2", "nf4"))
+        check("device label names the model",
+              window.device_label.text().startswith("FLUX.2-dev"))
+        flux1 = next(a for a in window.model_actions.actions() if a.data() == "flux1")
+        flux1.trigger()
+        check("edited steps survive a model switch",
+              window.params_panel.values()["steps"] == 20)
+        check("quant stays nf4 when FLUX.1 can run it", window.settings.quant == "nf4")
+        QTimer.singleShot(300, verify_model_back)
+
+    def verify_model_back() -> None:
+        # The menu group is disabled during the reload, so only check once
+        # the load has landed.
+        check("switching back reloads FLUX.1", FakeHost.loads[-1] == ("flux1", "nf4"))
+        check("switching back re-enables bf16",
+              next(a for a in window.quant_actions.actions() if a.data() == "bf16").isEnabled())
+        window.settings.quant = "bf16"  # don't persist the smoke picks
+        window.settings.model = "flux1"
         finish()
 
     def finish() -> None:
