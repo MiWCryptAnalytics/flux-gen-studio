@@ -9,13 +9,17 @@ from __future__ import annotations
 
 from PyQt5.QtGui import QColor
 
+from ..core.config import ASSETS_DIR
 from .metrics import Metrics, metrics
+
+ICONS_DIR = ASSETS_DIR / "icons"
 
 # Palette
 BG = "#14161a"
 PANEL = "#1b1e24"
 PANEL_ALT = "#22262e"
 BORDER = "#2e333d"
+FIELD_BORDER = "#3d4453"  # inputs stand out from panel edges
 TEXT = "#e6e9ef"
 TEXT_DIM = "#8d95a5"
 ACCENT = "#5b9cff"
@@ -42,13 +46,24 @@ def build_qss(m: Metrics | None = None) -> str:
     bar_h = m.sp(0.35)
     check_box = m.sp(0.85)
     scroll_w = m.sp(0.55)
+    arrow = m.sp(0.5)  # chevrons on spin boxes and combos, sized from the font
+    up = (ICONS_DIR / "chevron-up.svg").as_posix()
+    down = (ICONS_DIR / "chevron-down.svg").as_posix()
 
     return f"""
-/* Base widgets inherit the application font — never pin a pixel size here,
-   or the UI stops following the user's font/DPI settings. */
+/* The base font is pinned to the application font on purpose. Several widget
+   classes (QPushButton, QCheckBox, QLabel, item views, …) otherwise resolve
+   their font from platform-theme class defaults captured at login and ignore
+   a scaled application font entirely — text renders half-size at a 2x UI
+   scale. m.pt(1.0) IS the application font in points, re-derived every time
+   the stylesheet is built, so this still follows the user's font/DPI settings
+   and View ▸ Text size; it just makes every widget class do so. Never pin a
+   *pixel* size here. */
 QWidget {{
     background: {BG};
     color: {TEXT};
+    font-family: "{m.family}";
+    font-size: {m.pt(1.0)}pt;
 }}
 QLabel, QCheckBox {{ background: transparent; }}
 QLabel[role="title"] {{
@@ -59,6 +74,8 @@ QLabel[role="title"] {{
 }}
 QLabel[role="hint"] {{ color: {TEXT_DIM}; font-size: {m.pt(0.86)}pt; }}
 QLabel[role="metric"] {{ color: {TEXT_DIM}; font-size: {m.pt(0.86)}pt; }}
+/* Names of editable fields: full contrast, so the controls read as controls. */
+QLabel[role="label"] {{ color: {TEXT}; font-size: {m.pt(0.9)}pt; }}
 
 QFrame[role="panel"] {{
     background: {PANEL};
@@ -76,7 +93,7 @@ QFrame[role="card"][slot="B"] {{ border-left: {m.sp(0.18)}px solid {SLOT_B}; }}
 
 QPlainTextEdit, QTextEdit, QLineEdit {{
     background: {PANEL_ALT};
-    border: 1px solid {BORDER};
+    border: 1px solid {FIELD_BORDER};
     border-radius: {radius_sm}px;
     padding: {pad_y}px;
     selection-background-color: {ACCENT_DIM};
@@ -85,7 +102,7 @@ QPlainTextEdit:focus, QTextEdit:focus, QLineEdit:focus {{ border: 1px solid {ACC
 
 QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {PANEL_ALT};
-    border: 1px solid {BORDER};
+    border: 1px solid {FIELD_BORDER};
     border-radius: {radius_sm}px;
     padding: {max(2, pad_y - 1)}px {pad_x}px;
     min-height: {field_h}px;
@@ -99,7 +116,25 @@ QLineEdit:disabled, QPlainTextEdit:disabled {{
 }}
 QCheckBox:disabled {{ color: {TEXT_DIM}; }}
 QLabel:disabled {{ color: {TEXT_DIM}; }}
-QComboBox::drop-down {{ border: none; width: {m.sp(0.9)}px; }}
+/* Fusion draws spin and combo arrows at a fixed pixel size that vanishes at
+   HiDPI scales, so they are drawn from SVG at a size that follows the font. */
+QComboBox::drop-down {{ border: none; width: {m.sp(1.1)}px; }}
+QComboBox::down-arrow {{ image: url("{down}"); width: {arrow}px; height: {arrow}px; }}
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+    width: {m.sp(1.0)}px;
+    border: none;
+    background: transparent;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    image: url("{up}"); width: {arrow}px; height: {arrow}px;
+}}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image: url("{down}"); width: {arrow}px; height: {arrow}px;
+}}
+QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled,
+QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled,
+QComboBox::down-arrow:disabled {{ image: none; }}
 QComboBox QAbstractItemView {{
     background: {PANEL_ALT};
     border: 1px solid {BORDER};
@@ -174,7 +209,7 @@ QSplitter::handle:horizontal {{ width: 2px; }}
 QCheckBox {{ spacing: {m.sp(0.35)}px; }}
 QCheckBox::indicator {{
     width: {check_box}px; height: {check_box}px;
-    border: 1px solid {BORDER};
+    border: 1px solid {FIELD_BORDER};
     border-radius: {radius_sm}px;
     background: {PANEL_ALT};
 }}
@@ -187,9 +222,10 @@ QStatusBar::item {{ border: none; }}
 QMenuBar {{ background: {BG}; color: {TEXT}; }}
 QMenuBar::item {{ background: transparent; padding: {pad_y}px {pad_x}px; }}
 QMenuBar::item:selected {{ background: {PANEL_ALT}; }}
-QMenu {{ background: {PANEL_ALT}; border: 1px solid {BORDER}; }}
+QMenu {{ background: {PANEL_ALT}; color: {TEXT}; border: 1px solid {BORDER}; }}
 QMenu::item {{ padding: {pad_y}px {m.sp(1.2)}px; }}
 QMenu::item:selected {{ background: {ACCENT_DIM}; }}
+QMenu::item:disabled {{ color: {TEXT_DIM}; }}
 QMenu::separator {{ height: 1px; background: {BORDER}; margin: {m.sp(0.2)}px 0; }}
 
 QToolTip {{
@@ -197,5 +233,6 @@ QToolTip {{
     color: {TEXT};
     border: 1px solid {BORDER};
     padding: {max(2, pad_y - 2)}px;
+    font-size: {m.pt(0.92)}pt;
 }}
 """

@@ -45,6 +45,17 @@ s/step.
   **Clear unstarred** deletes everything you didn't star.
 - `Esc` cancels a running job after the current step.
 
+On a HiDPI screen the app picks a sensible text size by itself when the
+desktop hasn't configured one (a bare X11 session on a 4K monitor, say):
+everything in the UI is sized from the font, so one font change scales the
+whole layout, and it stays crisp because nothing is resampled. **View ▸ Text
+larger / smaller** (`Ctrl+=` / `Ctrl+-`) adjusts it in quarter steps and
+remembers the choice; **auto for this screen** (`Ctrl+0`) goes back to
+detection. `--scale 2` sets it for one launch, `FLUXSTUDIO_SCALE=1.5`
+forces it and `FLUXSTUDIO_SCALE=1` disables detection; desktop scaling and
+the usual `QT_FONT_DPI` / `QT_SCALE_FACTOR` knobs are respected untouched.
+The UI typeface is bundled (IBM Plex Sans, SIL OFL), as in the voice studio.
+
 Every PNG carries its full recipe (prompt, seed, steps, guidance, size) in
 its metadata, and the same recipe is stored in the history, so any image can
 be reproduced or resumed later.
@@ -214,7 +225,8 @@ step count.
 fluxstudio/
   core/      config (paths, settings), history (renders + stars)
   engine/    loader (model registry, pipeline placement by VRAM), generate (one denoise run)
-  ui/        theme + metrics (shared studio look), panels, workers (QThread host)
+  ui/        theme + metrics + scaling + fonts (shared studio look), panels,
+             workers (QThread host)
 ```
 
 The model runs entirely on a worker `QThread`; the UI talks to it only

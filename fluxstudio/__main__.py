@@ -46,6 +46,12 @@ def main() -> int:
              "or flux2 (FLUX.2-dev, NF4 only, ~20 GiB free VRAM)",
     )
     parser.add_argument(
+        "--scale", type=float, default=None, metavar="FACTOR",
+        help="UI text size factor for this launch (e.g. 2 on a 4K monitor); "
+             "by default the app picks one from the screen's DPI, and "
+             "View ▸ Text size remembers a choice",
+    )
+    parser.add_argument(
         "--quant", choices=("bf16", "nf4", "int8"), default=None,
         help="model precision for this launch, overriding the saved setting "
              "(nf4 needs ~14 GiB free VRAM to run FLUX.1-dev fully on the GPU)",
@@ -58,31 +64,48 @@ def main() -> int:
         set_tag(args.tag)
         logging.getLogger("fluxstudio").info("performance tag: %s", args.tag)
 
-    # All three must be set before the QApplication exists. PassThrough keeps
-    # fractional scale factors (1.25, 1.5, …) intact instead of rounding them
-    # to integers, which is what makes the UI look either cramped or bloated
-    # on HiDPI.
+    # All three must be set before the QApplication exists. Qt derives its
+    # scale factor from the X server's Xft.dpi, and a value like 92 would give
+    # a fractional 0.96 that leaves every 1px border and glyph resampled and
+    # blurry — so round it to an integer and let the font-based scaling below
+    # (ui.scaling) handle the size. Only Qt5 needs the attribute; the policy
+    # call is missing before 5.14.
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     try:
         QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+            Qt.HighDpiScaleFactorRoundingPolicy.Round
         )
     except AttributeError:
-        pass  # Qt < 5.14
+        pass
 
     app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName(APP_NAME)
 
     # Imported after the QApplication so sizing reads the real application font.
+    from .core.config import Settings
     from .ui import MainWindow
+    from .ui import scaling
+    from .ui.fonts import install_application_font
     from .ui.metrics import refresh
     from .ui.theme import build_qss
 
+    # Order matters: the bundled typeface first (family change only), then the
+    # scale (multiplies the size), then metrics/QSS which bake both into every
+    # derived dimension.
+    install_application_font(app)
+    factor, source = scaling.resolve_factor(app, cli=args.scale, saved=Settings.load().ui_scale)
+    if source == "auto":
+        scaling.apply_auto_scale(app)
+    else:
+        scaling.apply_scale(app, factor)
+        logging.getLogger("fluxstudio").info("UI scale x%g (%s)", factor, source)
     app.setStyleSheet(build_qss(refresh()))
 
-    window = MainWindow(quant=args.quant, model=args.model)
-    window.show()
+    # The window replaces itself when the text size changes (see
+    # MainWindow.rescale), so the live one is tracked on the application.
+    app.studio_window = MainWindow(quant=args.quant, model=args.model)
+    app.studio_window.show()
     return app.exec_()
 
 

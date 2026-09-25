@@ -14,6 +14,7 @@ def _data_root() -> Path:
 
 
 DATA_DIR = _data_root()
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 RENDERS_DIR = DATA_DIR / "renders"
 EXPORTS_DIR = DATA_DIR / "exports"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -40,6 +41,7 @@ class Settings:
     model: str = "flux1"  # flux1 | flux2 (see engine.loader.MODELS)
     quant: str = "bf16"  # model precision: bf16 | nf4 | int8 (see engine.loader)
     batch_dir: str = ""  # last folder a prompt file was opened from
+    ui_scale: float = 0.0  # View ▸ Text size factor; 0 = auto-detect (see ui.scaling)
     window_geometry: list[int] = field(default_factory=list)
 
     @classmethod

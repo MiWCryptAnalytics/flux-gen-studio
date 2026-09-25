@@ -42,9 +42,10 @@ ASPECT_PRESETS = [
 CUSTOM = "Custom"
 
 
-def _hint(text: str) -> QLabel:
+def _label(text: str) -> QLabel:
+    """The name of an editable field — full contrast, unlike a hint."""
     label = QLabel(text)
-    label.setProperty("role", "hint")
+    label.setProperty("role", "label")
     return label
 
 
@@ -111,7 +112,7 @@ class ParamsPanel(QFrame):
             row, col = divmod(i, 2)
             cell = QVBoxLayout()
             cell.setSpacing(m.sp(0.12))
-            cell.addWidget(_hint(label))
+            cell.addWidget(_label(label))
             cell.addWidget(widget)
             container = QWidget()
             container.setLayout(cell)
@@ -127,7 +128,7 @@ class ParamsPanel(QFrame):
     def _build_aspect_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(metrics().sp(0.45))
-        row.addWidget(_hint("Aspect"))
+        row.addWidget(_label("Aspect"))
         self.aspect_combo = QComboBox()
         self.aspect_combo.addItems([name for name, _, _ in ASPECT_PRESETS])
         self.aspect_combo.addItem(CUSTOM)
@@ -180,7 +181,7 @@ class ParamsPanel(QFrame):
         dice.setToolTip("New random seed")
         dice.clicked.connect(lambda: self.seed_spin.setValue(new_seed()))
 
-        row.addWidget(_hint("Seed"))
+        row.addWidget(_label("Seed"))
         row.addWidget(self.seed_spin, 1)
         row.addWidget(dice)
         row.addWidget(self.seed_lock)

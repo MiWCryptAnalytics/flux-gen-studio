@@ -11,6 +11,7 @@ from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices, QGuiApplication, QKeySequence
 from PyQt5.QtWidgets import (
     QActionGroup,
+    QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -37,12 +38,14 @@ from ..engine import (
     new_seed,
     quant_label,
 )
+from . import scaling
 from .gallery_panel import GalleryPanel
 from .job_panel import JobPanel
-from .metrics import metrics
+from .metrics import metrics, refresh
 from .params_panel import ParamsPanel
 from .perf_dialog import PerfDialog
 from .prompt_panel import PromptPanel
+from .theme import build_qss
 from .viewer import PreviewPanel
 from .workers import BATCH, SINGLE, VARIATIONS, EngineHost, GenJob, RenderResult
 
@@ -54,9 +57,18 @@ class MainWindow(QMainWindow):
     loadRequested = pyqtSignal(str, str)  # model key, precision to load
     jobRequested = pyqtSignal(object)
 
-    def __init__(self, quant: str | None = None, model: str | None = None) -> None:
+    def __init__(
+        self,
+        quant: str | None = None,
+        model: str | None = None,
+        engine: tuple[QThread, EngineHost] | None = None,
+    ) -> None:
+        """``engine`` hands over a running engine thread from a window being
+        replaced (View ▸ Text size), so the loaded model survives the rebuild."""
         super().__init__()
         ensure_dirs()
+        self._handed_off = False  # engine passed to a successor; don't stop it
+        self._loading = False
 
         self.settings = Settings.load()
         # CLI overrides persist like a menu pick.
@@ -82,7 +94,7 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self._restore_settings()
         self.params_panel.set_model(self.spec)
-        self._start_engine()
+        self._start_engine(engine)
 
     @property
     def spec(self):
@@ -200,6 +212,21 @@ class MainWindow(QMainWindow):
         perf.setShortcut(QKeySequence("Ctrl+P"))
         perf.triggered.connect(self._show_performance)
 
+        view = self.menuBar().addMenu("&View")
+        self.scale_action = view.addAction("")
+        self.scale_action.setEnabled(False)  # a readout, not a command
+        view.addSeparator()
+        larger = view.addAction("Text &larger")
+        larger.setShortcuts([QKeySequence.ZoomIn, QKeySequence("Ctrl+=")])
+        larger.triggered.connect(lambda: self._step_scale(+scaling.STEP))
+        smaller = view.addAction("Text &smaller")
+        smaller.setShortcut(QKeySequence.ZoomOut)
+        smaller.triggered.connect(lambda: self._step_scale(-scaling.STEP))
+        auto = view.addAction("Text size &auto for this screen")
+        auto.setShortcut(QKeySequence("Ctrl+0"))
+        auto.triggered.connect(lambda: self.rescale(None))
+        self._update_scale_readout()
+
     def _build_status_bar(self) -> None:
         bar = self.statusBar()
 
@@ -235,12 +262,56 @@ class MainWindow(QMainWindow):
         bind("Ctrl+2", lambda: self.gallery.show_slot("B"))
         bind("Escape", self._cancel_job)
 
+    # ---------- text size ----------
+
+    def _update_scale_readout(self) -> None:
+        factor = scaling.current_factor()
+        how = "auto" if not self.settings.ui_scale else "saved"
+        self.scale_action.setText(f"Text size ×{factor:g} ({how})")
+
+    def _step_scale(self, delta: float) -> None:
+        self.rescale(round((scaling.current_factor() + delta) / scaling.STEP) * scaling.STEP)
+
+    def rescale(self, factor: float | None) -> None:
+        """Apply a text size (None = auto for this screen) and rebuild the UI.
+
+        Every dimension in the app is baked from the font when a widget is
+        built, so the honest way to resize is to build a fresh window. The
+        engine thread — and the model it holds — is handed over untouched.
+        """
+        if self._busy or self._loading:
+            self.status_label.setText("Wait for the current job before resizing the text.")
+            return
+        app = QApplication.instance()
+        target = scaling.auto_factor(app) if factor is None else scaling.clamp(factor)
+        if abs(target - scaling.current_factor()) < 0.01 and (factor is None) == (
+            not self.settings.ui_scale
+        ):
+            return
+        self.settings.ui_scale = 0.0 if factor is None else target
+        self._persist_settings()
+        scaling.apply_scale(app, target)
+        app.setStyleSheet(build_qss(refresh()))
+        log.info("UI scale x%g (%s); rebuilding window", target, "auto" if factor is None else "saved")
+
+        successor = MainWindow(engine=(self.thread, self.host))
+        if self.preview.render is not None:
+            successor.preview.show_render(self.preview.render)
+        successor.show()
+        app.studio_window = successor
+        self._handed_off = True
+        self.close()
+        self.deleteLater()
+
     # ---------- engine thread ----------
 
-    def _start_engine(self) -> None:
-        self.thread = QThread(self)
-        self.host = EngineHost()
-        self.host.moveToThread(self.thread)
+    def _start_engine(self, engine: tuple[QThread, EngineHost] | None = None) -> None:
+        if engine is not None:
+            self.thread, self.host = engine
+        else:
+            self.thread = QThread(self)
+            self.host = EngineHost()
+            self.host.moveToThread(self.thread)
 
         self.loadRequested.connect(self.host.load)
         self.jobRequested.connect(self.host.run_job)
@@ -256,7 +327,12 @@ class MainWindow(QMainWindow):
         self.host.jobDone.connect(self._on_job_done)
         self.host.jobFailed.connect(self._on_job_failed)
 
-        self.thread.start()
+        if engine is not None and self.host.is_ready:
+            # Inherited a loaded model: just reflect it.
+            self._on_load_ready(self.host.loaded)
+            return
+        if engine is None:
+            self.thread.start()
         self._begin_load()
 
     def _begin_load(self) -> None:
@@ -703,20 +779,31 @@ class MainWindow(QMainWindow):
         if s.seed:
             self.params_panel.show_seed(s.seed)
         if len(s.window_geometry) == 4:
-            self.setGeometry(*s.window_geometry)
+            # Saved under a different text size (or monitor), the stored
+            # geometry can exceed the screen — clamp it, or the window comes
+            # back taller than the work area and can't be managed sensibly.
+            x, y, width, height = s.window_geometry
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                width = min(width, avail.width())
+                height = min(height, avail.height())
+                x = max(avail.left(), min(x, avail.right() - width + 1))
+                y = max(avail.top(), min(y, avail.bottom() - height + 1))
+            self.setGeometry(x, y, width, height)
 
         renders = self.history.all()
         if renders:
             self.preview.show_render(renders[0])
 
-    def closeEvent(self, event) -> None:
+    def _persist_settings(self) -> None:
         s = self.settings
         s.prompt = self.prompt_panel.prompt
         s.variations = self.prompt_panel.variations_spin.value()
         s.seed = self.params_panel.seed_spin.value()
         s.seed_locked = self.params_panel.seed_locked
         s.__dict__.update(self.params_panel.values())
-        # s.model and s.quant are saved when picked.
+        # s.model, s.quant and s.ui_scale are saved when picked.
         geo = self.geometry()
         s.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
         try:
@@ -724,9 +811,12 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
-        self.host.cancel()
-        self.thread.quit()
-        self.thread.wait(5000)
+    def closeEvent(self, event) -> None:
+        self._persist_settings()
+        if not self._handed_off:
+            self.host.cancel()
+            self.thread.quit()
+            self.thread.wait(5000)
         super().closeEvent(event)
 
 

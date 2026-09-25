@@ -24,8 +24,39 @@ from PyQt5.QtWidgets import QApplication
 def main() -> int:
     app = QApplication(sys.argv)
 
+    from fluxstudio.ui import scaling
+    from fluxstudio.ui.fonts import install_application_font
     from fluxstudio.ui.metrics import refresh
     from fluxstudio.ui.theme import build_qss
+
+    failures: list[str] = []
+
+    def check(name: str, condition: bool) -> None:
+        print(("ok  " if condition else "FAIL") + f"  {name}")
+        if not condition:
+            failures.append(name)
+
+    # Typeface and HiDPI scale, in the order __main__ applies them.
+    check("bundled typeface installs", install_application_font(app) == "IBM Plex Sans")
+    BARE = {}
+    check("27-inch 4K on bare X11 scales x2", scaling.pick_scale(96, 163, 1.0, BARE) == 2.0)
+    check("24-inch 4K rounds to a quarter step", scaling.pick_scale(96, 184, 1.0, BARE) == 2.25)
+    check("13-inch 4K laptop caps at 3", scaling.pick_scale(96, 331, 1.0, BARE) == 3.0)
+    check("1080p desktop stays unscaled", scaling.pick_scale(96, 92, 1.0, BARE) == 1.0)
+    check("27-inch 1440p stays unscaled", scaling.pick_scale(96, 109, 1.0, BARE) == 1.0)
+    check("desktop-scaled session left alone",
+          scaling.pick_scale(96, 163, 2.0, BARE) == 1.0
+          and scaling.pick_scale(144, 163, 1.0, BARE) == 1.0
+          and scaling.pick_scale(96, 163, 1.0, {"QT_SCALE_FACTOR": "2"}) == 1.0)
+    check("forced env wins", scaling.pick_scale(96, 92, 1.0, {"FLUXSTUDIO_SCALE": "1.5"}) == 1.5)
+    forced = os.environ.get("FLUXSTUDIO_SCALE", "")
+    check("auto scale is inert headless unless forced",
+          scaling.auto_factor(app) == (float(forced) if forced else 1.0))
+    base_pt = app.font().pointSizeF()
+    scaling.apply_scale(app, 1.5)
+    check("scale reaches the application font", abs(app.font().pointSizeF() - base_pt * 1.5) < 0.05)
+    scaling.apply_scale(app, float(forced) if forced else 1.0)
+    check("base font restored", abs(app.font().pointSizeF() - base_pt * (float(forced) if forced else 1.0)) < 0.05)
 
     app.setStyleSheet(build_qss(refresh()))
 
@@ -60,15 +91,16 @@ def main() -> int:
     # MainWindow resolves EngineHost through its module globals, so patching
     # the name there is enough — no model weights are ever touched.
     mw.EngineHost = FakeHost
-    window = mw.MainWindow()
-    window.show()
+    app.studio_window = mw.MainWindow()
+    app.studio_window.show()
 
-    failures: list[str] = []
+    class _Live:
+        """Always the current window — View ▸ Text size replaces it."""
 
-    def check(name: str, condition: bool) -> None:
-        print(("ok  " if condition else "FAIL") + f"  {name}")
-        if not condition:
-            failures.append(name)
+        def __getattr__(self, name):
+            return getattr(app.studio_window, name)
+
+    window = _Live()
 
     def poke() -> None:
         check("three panes present", all(
@@ -165,7 +197,7 @@ def main() -> int:
               summary[0].s_per_step == 2.05 and summary[0].total == 80.5)
         check("encode estimate", abs(records[0].encode_estimate - 18.0) < 1e-9)
         from fluxstudio.ui.perf_dialog import PerfDialog
-        dialog = PerfDialog(window)
+        dialog = PerfDialog(app.studio_window)
         check("perf dialog rows",
               dialog.summary_table.rowCount() == 2 and dialog.recent_table.rowCount() == 3)
         check("perf dialog cell", dialog.summary_table.item(0, 7).text() == "2.05")
@@ -305,6 +337,26 @@ def main() -> int:
               next(a for a in window.quant_actions.actions() if a.data() == "bf16").isEnabled())
         window.settings.quant = "bf16"  # don't persist the smoke picks
         window.settings.model = "flux1"
+
+        # View ▸ Text size rebuilds the window around the same engine.
+        old = app.studio_window
+        host, thread = old.host, old.thread
+        before = scaling.current_factor()
+        old.rescale(before + scaling.STEP)
+        new = app.studio_window
+        check("rescale replaces the window", new is not old)
+        check("rescale keeps the engine", new.host is host and new.thread is thread)
+        check("rescale keeps the model without reloading",
+              new.host.is_ready and len(FakeHost.loads) == 4)
+        check("rescale grew the font",
+              abs(scaling.current_factor() - (before + scaling.STEP)) < 0.01)
+        check("readout shows the saved size",
+              new.scale_action.text().endswith("(saved)"))
+        check("rescaled window is usable", new.prompt_panel.generate_button.isEnabled())
+        new.rescale(None)
+        check("auto restores", abs(scaling.current_factor() - before) < 0.01
+              and app.studio_window.settings.ui_scale == 0.0)
+        app.setStyleSheet(build_qss(refresh()))
         finish()
 
     def finish() -> None:
